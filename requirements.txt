@@ -1,0 +1,4 @@
+ssi-fctrading
+ssi-fc-data
+python-binance
+websocket
