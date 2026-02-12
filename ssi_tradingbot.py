@@ -30,6 +30,12 @@ class SSITradingBot(BaseTradingBot):
         self.md_stream = None
         
         # Initialize clients
+        # CP1:
+        # - Sử dụng 2 package, khởi tạo 2 client độc lập cho Data và trading
+        # - Yêu cầu kí số vào phần data khi đẩy lệnh
+        # - Yêu cầu nhập OTP để khởi tạo access token
+        # - Yêu cầu truyền token vào header khi thực hiện các thao tác với API/Stream
+        # - SDK có hỗ trợ môi trường paper (môi trường paper bị off).
         try:
             self.trading_client = FCTradingClient(
                 self.url,
@@ -62,6 +68,13 @@ class SSITradingBot(BaseTradingBot):
 
     def place_order_api(self, side, quantity, price=None, order_type=None):
         """Place Order via SSI API"""
+        # CP4:
+        # - SDK ở mức tối thiểu, người dùng đọc tài liệu để biết được cần truyền những tham số gì để được loại lệnh như mong muốn
+        # - Có trường note để lưu thông tin: định danh client,....
+        # - Đặt lệnh thì sinh requestID ở client. response lệnh thành công ko trả về orderId để người dùng thao tác -> cần xử lý logic
+        #   -> Khi hủy lệnh thì chỉ sử dụng orderID
+        #   -> Khi đặt lệnh cần lưu lại requestID rồi dựa vào requestID đấy mapping với orderID ở kênh stream để cập nhật trạng thái lệnh
+        # - Chưa hỗ trợ đặt và hủy lệnh theo batch
         ssi_side = 'B' if side == 'BUY' else 'S'
         order_type_api = 'MTL' if self.mode == 'futures' else 'MP' # Default Market
         
@@ -143,7 +156,13 @@ class SSITradingBot(BaseTradingBot):
 
     def start_stream(self):
         """Start WebSocket streams"""
-        
+        # CP3:
+        # - Signalr: phải sử dụng client mà SSI cung cấp để kết nối, trong trường hợp người dùng muốn tùy biến client
+        #   thì cần nắm vững kiến thức Signalr để tùy biến kết nối websocket của mình.
+        # - Sử dụng 2 client độc lập cho Data/Trading: mỗi client có 1 cách implement khác nhau
+        # - Trading thì đang chia message lỗi cho 2 kênh tiếp cập -> callback 2 function 
+        #   -> khi xử lý luồng bot cần để ý 2 callback này để tránh miss event
+
         # 1. Setup Trading Stream
         self.trading_stream = FCTradingStream(
             self.trading_client, 
@@ -182,6 +201,10 @@ class SSITradingBot(BaseTradingBot):
         
         # Load History
         print("Loading historical data...")
+        # CP2:
+        # - Hỗ trợ 2 timeframe (1m, 1d), muốn hành xử với các timeframe nhỏ hơn hoặc lớn hơn 
+        #   thì tự lưu trữ tick lại rồi tự tổng hợp. Không cung cấp tick lịch sử để bổ sung dữ liệu
+        # - phải tự xử lý các event quyền để tự chia giá khi có thay đổi
         klines = self.data_client.intraday_ohlc(
             symbol=self.symbol,
             fromDate="2026-02-01",

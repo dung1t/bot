@@ -18,6 +18,9 @@ class BinanceTradingBot(BaseTradingBot):
         self.trade_amount_usdt = config.get('trade_amount_usdt', 100)
         
         # Initialize Client
+        # CP1:
+        # - Binance sử dụng 1package, 1 client cho cả Data/Trading
+        # - Binance có hỗ trợ môi trường paper
         if self.testnet:
             self.client = Client(api_key, api_secret, testnet=True)
             self.client.API_URL = 'https://testnet.binance.vision/api'
@@ -61,6 +64,11 @@ class BinanceTradingBot(BaseTradingBot):
         """Place Order via Binance API"""
         print(f"DEBUG: Placing {side} {quantity}")
         try:
+            # CP4:
+            # - SDK hỗ trợ nhiều method cho từng loại lệnh với từng argument truyền lên API -> người dùng ko bị confuse giữa các argument của API
+            # - Khi đặt lệnh có định danh cho clientId -> 1 tài khoản chạy nhiều bot thì vẫn nắm được lệnh nào của bot nào
+            # - Khi đặt lênh thành công thì server trả về response có kèm orderId để có thể trace luôn
+            # - Hỗ trợ đặt và hủy lệnh theo batch
             order = self.client.create_order(
                 symbol=self.symbol,
                 side=side,
@@ -115,6 +123,8 @@ class BinanceTradingBot(BaseTradingBot):
 
     def start_stream(self):
         """Start WebSocket streams"""
+        # CP3:
+        # - Raw Websocket: dễ dàng kết nối và tùy chỉnh với đa dạng ngôn ngữ
         self.ws = websocket.WebSocketApp(
             self.ws_url, on_message=self.on_trade_message,
             on_open=lambda ws: print("✅ Trade WS connected")
@@ -135,8 +145,12 @@ class BinanceTradingBot(BaseTradingBot):
         """Start Bot"""
         self.get_symbol_info()
         print("Loading historical data...")
-        klines = self.client.get_klines(
-            symbol=self.symbol, interval=Client.KLINE_INTERVAL_1MINUTE, limit=200
+        start_time="1 Jan, 2026"
+        end_time="1 Feb, 2026"
+        # CP2
+        # - Hỗ trợ da dạng timeframe data (1s, 1m,3m,5m,... 1d,3d,1w,1M)
+        klines = self.client.get_historical_klines(
+            symbol=self.symbol, interval=Client.KLINE_INTERVAL_1MINUTE, start_time, end_time
         )
         for k in klines:
             self.klines.append({
