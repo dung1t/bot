@@ -1,59 +1,33 @@
 """
-SSI Trading Bot
-- Support Futures
-- Multiple strategies
-- Risk management
+SSI Trading Bot (Inherits from BaseBot)
 """
-
+import json
 import time
 import threading
-from datetime import datetime
-from decimal import Decimal, ROUND_DOWN
-from collections import deque
+from base_bot import BaseTradingBot
+from ssi_fctrading import FCTradingClient, FCTradingStream
+from ssi_fc_data import FCDataClient, model, fc_md_stream
 
-# Import SSI Libraries
-try:
-    from ssi_fctrading import FCTradingClient
-    from ssi_fc_data import FCDataClient, model
-except ImportError:
-    # Mocks for IntelliSense/No-Error if libs missing
-    class FCTradingClient: def __init__(self, *args, **kwargs): pass
-    class FCDataClient: def __init__(self, *args, **kwargs): pass
-    class model: pass
-    print("⚠️  Libraries 'ssi-fctrading' or 'ssi-fc-data' not found.")
 
-class SSITradingBot:
-    def __init__(self, data_consumer_id, data_consumer_secret, trading_consumer_id, trading_consumer_secret, config):
-        """
-        Trading Bot với nhiều tính năng (Phiên bản SSI)
-        
-        :param config: Dictionary chứa cấu hình:
-        {
-            'symbol': 'VN30F2309',
-            'url': 'https://fc-trade.ssi.com.vn/',
-            'stream_url': 'wss://fc-data.ssi.com.vn/',
-            'private_key_path': 'path/to/private.pem',
-            'mode': 'futures',  # 'spot' hoặc 'futures'
-            'strategy': 'ma_cross',  # 'ma_cross', 'rsi'
-            'timeframe': '1m',
-            'trade_amount_qty': 1, # Số lượng hợp đồng/cổ phiếu
-            'risk_per_trade': 0.02,
-        }
-        """
+class SSITradingBot(BaseTradingBot):
+    def __init__(
+        self, data_consumer_id, data_consumer_secret,
+        trading_consumer_id, trading_consumer_secret, trading_private_key, otp,
+        config
+    ):
+        super().__init__(config)
         self.data_consumer_id = data_consumer_id
         self.data_consumer_secret = data_consumer_secret
         self.trading_consumer_id = trading_consumer_id
         self.trading_consumer_secret = trading_consumer_secret
-        self.config = config
-        
-        # Extract config
-        self.symbol = config.get('symbol', 'VN30F1M')
+        self.trading_private_key = trading_private_key
         self.url = config.get('url', 'https://fc-trade.ssi.com.vn/')
-        self.private_key_path = config.get('private_key_path', '')
-        self.mode = config.get('mode', 'futures')  # futures mainly
-        self.strategy_name = config.get('strategy', 'ma_cross')
         self.trade_amount_qty = config.get('trade_amount_qty', 1)
-        self.risk_per_trade = config.get('risk_per_trade', 0.02)
+        self.otp = otp
+        
+        # Stream objects
+        self.trading_stream = None
+        self.md_stream = None
         
         # Initialize clients
         try:
@@ -61,9 +35,10 @@ class SSITradingBot:
                 self.url,
                 self.trading_consumer_id,
                 self.trading_consumer_secret,
-                self.private_key_path
+                self.trading_private_key
             )
-            
+            self.trading_client.verifyCode(self.otp)
+
             self.data_client = FCDataClient(
                 self.data_consumer_id,
                 self.data_consumer_secret
@@ -71,488 +46,186 @@ class SSITradingBot:
         except Exception as e:
             print(f"❌ Error initializing SSI clients: {e}")
 
-        # Data storage
-        self.current_price = None
-        self.trades = deque(maxlen=1000)
-        self.klines = deque(maxlen=200)  # Lưu 200 nến
-        
-        # Position management
-        self.position = None
-        self.entry_price = None
-        self.position_size = 0
-        self.unrealized_pnl = 0
-        
-        # Strategy parameters
-        self.ma_fast = 10
-        self.ma_slow = 30
-        self.rsi_period = 14
-        self.rsi_overbought = 70
-        self.rsi_oversold = 30
-        
-        # WebSocket / Sync
-        self.running = False
-        
-        # Statistics
-        self.total_trades = 0
-        self.winning_trades = 0
-        self.total_pnl = 0
-        
-        # SSI specific info (defaults)
-        self.tick_size = 0.1 # Futures usually 0.1
-        self.step_size = 1
-        
     def get_symbol_info(self):
-        """Lấy thông tin chi tiết về symbol (Mock for SSI)"""
-        try:
-            # SSI API logic to get instrument details would go here
-            # For now we hardcode common values for VN30 Futures
-            if self.mode == 'futures':
-                self.tick_size = 0.1
-                self.step_size = 1
-            else:
-                self.tick_size = 100 # Equity
-                self.step_size = 100
-            
-            print(f"📊 Symbol Info:")
-            print(f"   Step Size: {self.step_size}")
-            print(f"   Tick Size: {self.tick_size}")
-            
-        except Exception as e:
-            print(f"❌ Error getting symbol info: {e}")
-    
-    def round_quantity(self, quantity):
-        """Làm tròn số lượng"""
-        return int(quantity) # SSI usually requires integer lots
-    
-    def round_price(self, price):
-        """Làm tròn giá"""
-        precision = len(str(self.tick_size).split('.')[-1].rstrip('0'))
-        if '.' in str(self.tick_size) and precision > 0:
-             return float(Decimal(str(price)).quantize(
-                Decimal(str(self.tick_size)), 
-                rounding=ROUND_DOWN
-            ))
+        """Get symbol specifics"""
+        if self.mode == 'futures':
+            self.tick_size = 0.1
+            self.step_size = 1
         else:
-            return int(price - (price % self.tick_size))
-    
+            self.tick_size = 100
+            self.step_size = 100
+        print(f"📊 Symbol Info: Tick {self.tick_size}, Step {self.step_size}")
+
     def calculate_quantity(self):
-        """Tính số lượng coin cần mua (Override: SSI use fixed quantity from config for simpler logic)"""
-        # In binance bot this calculates based on USDT amount.
-        # Here we just return the configured quantity for simplicity in Futures.
+        """Use configured quantity"""
         return self.trade_amount_qty
-    
-    def calculate_ma(self, period):
-        """Tính Moving Average"""
-        if len(self.klines) < period:
-            return None
-        
-        prices = [float(k['close']) for k in list(self.klines)[-period:]]
-        return sum(prices) / period
-    
-    def calculate_rsi(self, period=14):
-        """Tính RSI"""
-        if len(self.klines) < period + 1:
-            return None
-        
-        closes = [float(k['close']) for k in list(self.klines)[-(period+1):]]
-        
-        gains = []
-        losses = []
-        
-        for i in range(1, len(closes)):
-            change = closes[i] - closes[i-1]
-            if change > 0:
-                gains.append(change)
-                losses.append(0)
-            else:
-                gains.append(0)
-                losses.append(abs(change))
-        
-        avg_gain = sum(gains) / period
-        avg_loss = sum(losses) / period
-        
-        if avg_loss == 0:
-            return 100
-        
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
-        
-        return rsi
-    
-    def check_ma_cross_strategy(self):
-        """
-        MA Crossover Strategy
-        BUY: Fast MA crosses above Slow MA
-        SELL: Fast MA crosses below Slow MA
-        """
-        ma_fast = self.calculate_ma(self.ma_fast)
-        ma_slow = self.calculate_ma(self.ma_slow)
-        
-        if not ma_fast or not ma_slow:
-            return None
-        
-        print(f"📊 MA({self.ma_fast}): {ma_fast:.2f} | MA({self.ma_slow}): {ma_slow:.2f}")
-        
-        # Check for crossover
-        if ma_fast > ma_slow and self.position != 'LONG':
-            return 'BUY'
-        elif ma_fast < ma_slow and self.position == 'LONG':
-            return 'SELL'
-        
-        return None
-    
-    def check_rsi_strategy(self):
-        """
-        RSI Strategy
-        BUY: RSI < 30 (oversold)
-        SELL: RSI > 70 (overbought)
-        """
-        rsi = self.calculate_rsi(self.rsi_period)
-        
-        if not rsi:
-            return None
-        
-        print(f"📊 RSI({self.rsi_period}): {rsi:.2f}")
-        
-        if rsi < self.rsi_oversold and self.position != 'LONG':
-            return 'BUY'
-        elif rsi > self.rsi_overbought and self.position == 'LONG':
-            return 'SELL'
-        
-        return None
-    
-    def check_strategy(self):
-        """Route to appropriate strategy"""
-        if self.strategy_name == 'ma_cross':
-            return self.check_ma_cross_strategy()
-        elif self.strategy_name == 'rsi':
-            return self.check_rsi_strategy()
-        
-        return None
-    
-    def calculate_stop_loss_take_profit(self, side, entry_price):
-        """
-        Tính Stop Loss và Take Profit
-        SL: 2% từ entry
-        TP: 3% từ entry
-        """
-        if side == 'BUY':
-            sl_price = self.round_price(entry_price * 0.98)
-            tp_price = self.round_price(entry_price * 1.03)
-        else:
-            sl_price = self.round_price(entry_price * 1.02)
-            tp_price = self.round_price(entry_price * 0.97)
-        
-        return sl_price, tp_price
-    
-    def place_order(self, side, quantity):
-        """Đặt lệnh (SSI Implementation)"""
-        try:
-            print(f"\n💰 Đặt lệnh SSI {side} {quantity} {self.symbol}")
-            
-            ssi_side = 'B' if side == 'BUY' else 'S'
-            
-            # Market order type depends on instrument (VN30F uses MK, Equity uses MP)
-            order_type = 'MK' if self.mode == 'futures' else 'MP'
-            
-            # Example payload
-            req = {
-                "instrumentID": self.symbol,
-                "market": "VNFE" if self.mode == 'futures' else "VN",
-                "buySell": ssi_side,
-                "quantity": quantity,
-                "price": 0, # Market order
-                "channelID": "TA_API",
-                # "orderType": order_type 
-            }
-            
-            # Call API
-            # order = self.trading_client.new_order(req)
-            
-            # MOCK RESPONSE
-            order = {
-                'orderId': f"mock_{int(time.time())}",
-                'status': 'FILLED',
-                'avgPrice': self.current_price if self.current_price else 1000,
-                'executedQty': quantity
-            }
-            
-            filled_qty = float(order.get('executedQty', 0))
-            avg_price = float(order.get('avgPrice', 0))
-            
-            print(f"✅ Order executed:")
-            print(f"   ID: {order['orderId']}")
-            print(f"   Filled: {filled_qty} @ {avg_price:.2f}")
-            print(f"   Status: {order['status']}")
-            
-            return {
-                'orderId': order['orderId'],
-                'quantity': filled_qty,
-                'price': avg_price,
-                'side': side
-            }
-            
-        except Exception as e:
-            print(f"❌ Error placing order: {e}")
-            return None
-    
-    def open_position(self, signal):
-        """Mở position mới"""
-        if self.position is not None:
-            print("⚠️  Position đã tồn tại, bỏ qua signal")
-            return
-        
-        quantity = self.calculate_quantity()
-        
-        if quantity <= 0:
-            print("❌ Quantity không hợp lệ")
-            return
-        
-        # Đặt lệnh
-        order = self.place_order(signal, quantity)
-        
-        if order:
-            self.position = 'LONG' if signal == 'BUY' else 'SHORT'
-            self.entry_price = order['price']
-            self.position_size = order['quantity']
-            
-            # Calculate SL/TP
-            sl_price, tp_price = self.calculate_stop_loss_take_profit(
-                signal, 
-                self.entry_price
-            )
-            
-            print(f"\n🎯 Position opened:")
-            print(f"   Type: {self.position}")
-            print(f"   Entry: {self.entry_price:.2f}")
-            print(f"   Size: {self.position_size}")
-            print(f"   Stop Loss: {sl_price:.2f}")
-            print(f"   Take Profit: {tp_price:.2f}")
-            
-            self.total_trades += 1
-    
-    def close_position(self, reason="Strategy signal"):
-        """Đóng position"""
-        if self.position is None:
-            return
-        
-        side = 'SELL' if self.position == 'LONG' else 'BUY'
-        
-        # Đặt lệnh đóng
-        order = self.place_order(side, self.position_size)
-        
-        if order:
-            exit_price = order['price']
-            
-            # Tính P&L
-            if self.position == 'LONG':
-                pnl = (exit_price - self.entry_price) * self.position_size * 100000 # Contract multiplier for futures
-            else:
-                pnl = (self.entry_price - exit_price) * self.position_size * 100000
-            
-            if self.mode != 'futures':
-                # Basic PnL for spot (no multiplier)
-                 if self.position == 'LONG':
-                    pnl = (exit_price - self.entry_price) * self.position_size
-                 else:
-                    pnl = (self.entry_price - exit_price) * self.position_size
 
-            pnl_pct = (pnl / (self.entry_price * self.position_size)) * 100 if self.mode != 'futures' else 0 # Approx
-            
-            self.total_pnl += pnl
-            
-            if pnl > 0:
-                self.winning_trades += 1
-                emoji = "💚"
-            else:
-                emoji = "❤️"
-            
-            print(f"\n{emoji} Position closed ({reason}):")
-            print(f"   Entry: {self.entry_price:.2f}")
-            print(f"   Exit: {exit_price:.2f}")
-            print(f"   P&L: {pnl:,.0f} VND")
-            print(f"   Total P&L: {self.total_pnl:,.0f} VND")
-            
-            # Reset position
-            self.position = None
-            self.entry_price = None
-            self.position_size = 0
-    
-    def check_position_management(self):
-        """Kiểm tra Stop Loss / Take Profit"""
-        if not self.position or not self.entry_price or not self.current_price:
-            return
+    def place_order_api(self, side, quantity, price=None, order_type=None):
+        """Place Order via SSI API"""
+        ssi_side = 'B' if side == 'BUY' else 'S'
+        order_type_api = 'MTL' if self.mode == 'futures' else 'MP' # Default Market
         
-        if self.position == 'LONG':
-            pnl_pct = (self.current_price - self.entry_price) / self.entry_price
-            
-            # Stop Loss
-            if pnl_pct <= -0.02:
-                self.close_position("Stop Loss")
-                return
-            
-            # Take Profit
-            if pnl_pct >= 0.03:
-                self.close_position("Take Profit")
-                return
-            
-            # Update unrealized P&L
-            self.unrealized_pnl = pnl_pct * 100
-    
-    def print_status(self):
-        """In trạng thái hiện tại"""
-        print(f"\n{'='*60}")
-        print(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        if self.current_price:
-            print(f"💰 Price: {self.current_price:,.2f}")
+        req = {
+            "instrumentID": self.symbol,
+            "market": "VNFE" if self.mode == 'futures' else "VN",
+            "buySell": ssi_side,
+            "quantity": quantity,
+            "orderType": order_type_api,
+            "price": 0,
+            "channelID": "TA"
+        }
         
-        if self.position:
-            print(f"📊 Position: {self.position}")
-            print(f"   Entry: {self.entry_price:,.2f}")
-            print(f"   Size: {self.position_size}")
-            print(f"   Unrealized P&L: {self.unrealized_pnl:+.2f}%")
-        else:
-            print(f"📊 Position: None")
+        # Real API call would go here:
+        order = self.trading_client.new_order(req)
         
-        if self.total_trades > 0:
-            win_rate = self.winning_trades / self.total_trades * 100
-            print(f"📈 Stats:")
-            print(f"   Total Trades: {self.total_trades}")
-            print(f"   Win Rate: {win_rate:.1f}%")
-            print(f"   Total P&L: {self.total_pnl:,.0f} VND")
-        
-        print(f"{'='*60}\n")
-    
-    def on_message(self, message):
-        """Process data (Unified for SSI Stream)"""
+        # Mock Response
+        return {
+            'orderId': order.orderId,
+            'price': order.price,
+            'quantity': order.quantity
+        }
+
+    def on_trade_message(self, ws, message):
+        """Process trade data"""
         try:
-            # SSI sends various messages. We filter for Trade/Quote
-            # Mock structure parsing
-            # data = json.loads(message)
-            # if 'LastPrice' in data: ...
-            
-            # Mock update because I cannot run real stream
+            data = json.loads(message)
+            self.current_price = float(data['p'])
+            self.check_position_management()
+        except Exception:
             pass
-            
-        except Exception as e:
-            print(f"❌ Error processing message: {e}")
 
-    def on_market_update(self, price, volume, time_str):
-        """Called when new price data arrives (Simulating Stream)"""
-        self.current_price = float(price)
+    def on_trading_open(self):
+        """Callback for Trading Stream Open"""
+        print("✅ Trading Stream Connected")
+
+    def on_kline_message(self, ws, message):
+        """Process kline data"""
+        try:
+            data = json.loads(message)
+            kline = data['k']
+            if kline['x']:
+                self.klines.append({
+                    'time': kline['t'], 'open': kline['o'], 'high': kline['h'], 
+                    'low': kline['l'], 'close': kline['c'], 'volume': kline['v']
+                })
+                signal = self.check_strategy()
+                if signal:
+                    if (signal == 'BUY' and self.position != 'LONG') or \
+                       (signal == 'SELL' and self.position == 'LONG'):
+                        if self.position: self.close_position()
+                        self.open_position(signal)
+                self.print_status()
+        except Exception as e:
+            print(f"Kline Error: {e}")
+
+    def on_data_error(self, error):
+        """Callback for Data Stream Errors"""
+        print(f"❌ Data Stream Error: {error}")
+
+    def _run_trading_stream(self):
+        """Thread target for Trading Stream"""
+        try:
+            self.trading_stream.start()
+            while self.running:
+                time.sleep(1)
+        except Exception as e:
+            print(f"❌ Trading Stream Thread Error: {e}")
+
+    def _run_data_stream(self):
+        """Thread target for Data Stream"""
+        try:
+            channel = f"B:{self.symbol}"
+            self.md_stream.start(self.on_kline_message, self.on_data_error, channel)
+            while self.running:
+                time.sleep(1)
+        except Exception as e:
+            print(f"❌ Data Stream Thread Error: {e}")
+
+    def start_stream(self):
+        """Start WebSocket streams"""
         
-        # NOTE: SSI Data Stream handling is complex to map 1:1 to Binance 'trade' vs 'kline' channels cleanly without real data structure.
-        # We assume we construct candles manually from ticks or receive minute bars if supported.
-        # For this refactor, I will simulate 'on_kline_message' logic here if we were building candles.
+        # 1. Setup Trading Stream
+        self.trading_stream = FCTradingStream(
+            self.trading_client, 
+            self.url, 
+            self.on_trade_message, 
+            self.on_trade_message, 
+            on_open=lambda ws: print("✅ Trade WS connected")
+        )
         
-        # ... logic to build candles ...
-        # If candle closed:
-        #   self.klines.append(new_candle)
-        #   signal = self.check_strategy()
-        #   ... (same as binance)
+        # 2. Setup Market Data Stream
+        class Config:
+            def __init__(self):
+                self.stream_url = "wss://fc-data.ssi.com.vn/"
+                self.auth_type = "Bearer"
         
-        self.check_position_management()
-        self.print_status()
+        self.md_stream = fc_md_stream.MarketDataStream(
+            Config(), 
+            self.data_client, 
+            on_open=lambda ws: print("✅ Kline WS connected")
+        )
+        
+        # 3. Start Threads
+        # Using separate thread methods to keep Main Thread clean just like Binance's run_forever logic
+        t1 = threading.Thread(target=self._run_trading_stream)
+        t2 = threading.Thread(target=self._run_data_stream)
+        
+        t1.daemon = True
+        t2.daemon = True
+        
+        t1.start()
+        t2.start()
 
     def start(self):
-        """Khởi động bot"""
-        print("\n" + "="*60)
-        print("🤖 SSI TRADING BOT")
-        print("="*60)
-        print(f"Symbol: {self.symbol}")
-        print(f"Mode: {self.mode.upper()}")
-        print(f"Strategy: {self.strategy_name.upper()}")
-        print(f"Quantity: {self.trade_amount_qty}")
-        print("="*60 + "\n")
-        
-        # Get symbol info
+        """Start Bot"""
         self.get_symbol_info()
         
-        # Get initial kline data (Mock)
-        print("📊 Loading historical data...")
-        # klines = self.data_client.get_history(...)
-        # For now, fake headers to match binance logic
-        for _ in range(50):
+        # Load History
+        print("Loading historical data...")
+        klines = self.data_client.intraday_ohlc(
+            symbol=self.symbol,
+            fromDate="2026-02-01",
+            toDate="2026-02-11",
+            pageIndex=1,
+            pageSize=200
+        )
+        for k in klines:
             self.klines.append({
-                'time': 0, 'open': 1000, 'high': 1005, 'low': 995, 'close': 1000, 'volume': 100
+                'time': k[0], 'open': k[1], 'high': k[2], 'low': k[3], 'close': k[4], 'volume': k[5]
             })
+        print(f"Loaded {len(self.klines)} candles")
         
-        print(f"✅ Loaded {len(self.klines)} candles")
-        
-        # Start WebSocket streams
         self.running = True
-        
-        # Mocking the thread run like Binance
-        # In reality, SSI Data Client has its own stream method which might block or be async.
-        # We will wrap it in a thread.
-        
-        def run_stream():
-            print("✅ Data Stream connected")
-            # self.data_client.stream(self.symbol, self.on_message)
-            while self.running:
-                time.sleep(1)
-                # Simulate price update for demo
-                # self.on_market_update(1200, 10, "now")
-        
-        thread = threading.Thread(target=run_stream)
-        thread.daemon = True
-        thread.start()
-        
-        print("\n🚀 Bot running! Press Ctrl+C to stop.\n")
-        
-        try:
-            while self.running:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            self.stop()
-    
-    def stop(self):
-        """Dừng bot"""
-        print("\n⏹️  Stopping bot...")
-        
-        # Close any open positions
-        if self.position:
-            print("⚠️  Closing open position...")
-            self.close_position("Bot stopped")
-        
-        self.running = False
-        
-        print("✅ Bot stopped successfully!")
-        print(f"\n📊 Final Statistics:")
-        print(f"   Total Trades: {self.total_trades}")
-        if self.total_trades > 0:
-            print(f"   Winning Trades: {self.winning_trades}")
-            print(f"   Win Rate: {self.winning_trades/self.total_trades*100:.1f}%")
-        print(f"   Total P&L: {self.total_pnl:,.0f} VND")
-
+        self.start_stream()
+        self.run_loop()
 
 def main():
-    """Main function"""
-    
-    # Configuration
     DATA_CONSUMER_ID = "YOUR_ID"
     DATA_CONSUMER_SECRET = "YOUR_SECRET"
     TRADING_CONSUMER_ID = "YOUR_ID"
     TRADING_CONSUMER_SECRET = "YOUR_SECRET"
+    TRADING_PRIVATE_KEY = "YOUR_PRIVATE_KEY"
+    OTP = "123456"
     
-    if TRADING_CONSUMER_ID == "YOUR_ID" or  DATA_CONSUMER_ID == "YOUR_ID":
-        print("❌ Vui lòng thay TRADING_CONSUMER_ID và DATA_CONSUMER_ID")
+    if TRADING_CONSUMER_ID == "YOUR_ID":
+        print("❌ Please update credentials")
         return
     
     config = {
         'symbol': 'VN30F2M',
         'url': 'https://fc-trade.ssi.com.vn/',
-        'private_key_path': 'key.pem',
         'mode': 'futures',
         'strategy': 'ma_cross',
         'trade_amount_qty': 1,
         'risk_per_trade': 0.02,
     }
     
-    # Create and start bot
-    bot = SSITradingBot(DATA_CONSUMER_ID, DATA_CONSUMER_SECRET, TRADING_CONSUMER_ID, TRADING_CONSUMER_SECRET, config)
+    bot = SSITradingBot(
+        DATA_CONSUMER_ID, DATA_CONSUMER_SECRET,
+        TRADING_CONSUMER_ID, TRADING_CONSUMER_SECRET, TRADING_PRIVATE_KEY, OTP,
+        config
+    )
     bot.start()
-
 
 if __name__ == "__main__":
     main()
